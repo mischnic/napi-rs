@@ -1,13 +1,18 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::CStr;
+use std::ffi::{c_void, CStr};
 use std::ptr;
+#[cfg(all(feature = "tokio_rt", feature = "napi4"))]
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::{check_status, check_status_or_throw, sys, JsError, Property, Result};
 
 pub type ExportRegisterCallback = unsafe fn(sys::napi_env) -> Result<sys::napi_value>;
 pub type ModuleExportsCallback =
   unsafe fn(env: sys::napi_env, exports: sys::napi_value) -> Result<()>;
+
+#[cfg(all(feature = "tokio_rt", feature = "napi4"))]
+const MODULE_LOAD_COUNT: AtomicU8 = AtomicU8::new(0);
 
 type ModuleRegisterCallback =
   RefCell<Vec<(Option<&'static str>, (&'static str, ExportRegisterCallback))>>;
@@ -75,7 +80,7 @@ unsafe extern "C" fn napi_register_module_v1(
   let mut exports_objects: HashMap<Option<&'static str>, sys::napi_value> = HashMap::default();
   MODULE_REGISTER_CALLBACK.with(|to_register_exports| {
     to_register_exports
-      .take()
+      .borrow_mut()
       .iter_mut()
       .fold(
         HashMap::<Option<&'static str>, Vec<(&'static str, ExportRegisterCallback)>>::new(),
@@ -142,7 +147,7 @@ unsafe extern "C" fn napi_register_module_v1(
   });
 
   MODULE_CLASS_PROPERTIES.with(|to_register_classes| {
-    for (rust_name, js_mods) in to_register_classes.take().iter() {
+    for (rust_name, js_mods) in to_register_classes.borrow().iter() {
       for (js_mod, (js_name, props)) in js_mods {
         let mut exports_js_mod = ptr::null_mut();
         unsafe {
@@ -238,11 +243,21 @@ unsafe extern "C" fn napi_register_module_v1(
   });
 
   #[cfg(all(feature = "tokio_rt", feature = "napi4"))]
-  if let Err(e) = check_status!(
-    sys::napi_add_env_cleanup_hook(env, Some(crate::shutdown_tokio_rt), ptr::null_mut()),
-    "Failed to initialize module",
-  ) {
-    JsError::from(e).throw_into(env);
+  {
+    #[cfg(all(feature = "tokio_rt", feature = "napi4"))]
+    let module_load_count = MODULE_LOAD_COUNT.fetch_add(1, Ordering::SeqCst);
+    assert_eq!(
+      sys::napi_add_env_cleanup_hook(
+        env,
+        Some(if module_load_count > 1 {
+          crate::shutdown_tokio_rt
+        } else {
+          decrease_module_load_count
+        }),
+        ptr::null_mut()
+      ),
+      sys::Status::napi_ok
+    );
   }
 
   exports
@@ -261,4 +276,9 @@ pub(crate) unsafe extern "C" fn noop(
     );
   }
   ptr::null_mut()
+}
+
+#[cfg(all(feature = "tokio_rt", feature = "napi4"))]
+pub(crate) unsafe extern "C" fn decrease_module_load_count(_arg: *mut c_void) {
+  MODULE_LOAD_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
 }
